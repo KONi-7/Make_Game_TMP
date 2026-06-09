@@ -44,6 +44,7 @@ type Assignment = {
   subject: string;
   type: TaskType;
   dueDate: string;
+  notificationDate?: string;
   priority: Priority;
   completed: boolean;
   note: string;
@@ -54,7 +55,7 @@ type Assignment = {
 
 type AssignmentForm = Pick<
   Assignment,
-  "title" | "subject" | "type" | "dueDate" | "priority" | "note"
+  "title" | "subject" | "type" | "dueDate" | "notificationDate" | "priority" | "note"
 >;
 
 const emptyForm: AssignmentForm = {
@@ -62,6 +63,7 @@ const emptyForm: AssignmentForm = {
   subject: "",
   type: "report",
   dueDate: "",
+  notificationDate: "",
   priority: "medium",
   note: "",
 };
@@ -108,6 +110,10 @@ function diffDaysFromToday(value: string) {
   const target = parseDateKey(value).getTime();
 
   return Math.round((target - today) / 86_400_000);
+}
+
+function getNotificationDate(task: Assignment) {
+  return task.notificationDate || task.dueDate;
 }
 
 function getDueStatus(task: Assignment) {
@@ -192,6 +198,20 @@ function sortTasks(tasks: Assignment[], sortMode: SortMode) {
   });
 }
 
+function sortNotificationTasks(tasks: Assignment[]) {
+  return [...tasks].sort((a, b) => {
+    const notificationDiff =
+      parseDateKey(getNotificationDate(a)).getTime() -
+      parseDateKey(getNotificationDate(b)).getTime();
+    if (notificationDiff !== 0) return notificationDiff;
+
+    const dueDiff = parseDateKey(a.dueDate).getTime() - parseDateKey(b.dueDate).getTime();
+    if (dueDiff !== 0) return dueDiff;
+
+    return priorityRank[a.priority] - priorityRank[b.priority];
+  });
+}
+
 export default function Home() {
   const [tasks, setTasks] = useState<Assignment[]>([]);
   const [form, setForm] = useState<AssignmentForm>(emptyForm);
@@ -267,12 +287,11 @@ export default function Home() {
   }, [tasks]);
 
   const closeTasks = useMemo(() => {
-    return sortTasks(
+    return sortNotificationTasks(
       tasks.filter((task) => {
-        const diff = diffDaysFromToday(task.dueDate);
-        return !task.completed && diff >= 0 && diff <= 1;
+        const diff = diffDaysFromToday(getNotificationDate(task));
+        return !task.completed && diff <= 0;
       }),
-      "dueDate",
     );
   }, [tasks]);
 
@@ -284,6 +303,7 @@ export default function Home() {
       ...form,
       title: form.title.trim(),
       subject: form.subject.trim() || "未分類",
+      notificationDate: form.notificationDate || form.dueDate,
       note: form.note.trim(),
     };
 
@@ -294,10 +314,10 @@ export default function Home() {
         currentTasks.map((task) =>
           task.id === editingId
             ? {
-                ...task,
-                ...payload,
-                updatedAt: now,
-              }
+              ...task,
+              ...payload,
+              updatedAt: now,
+            }
             : task,
         ),
       );
@@ -325,6 +345,7 @@ export default function Home() {
       subject: task.subject,
       type: task.type,
       dueDate: task.dueDate,
+      notificationDate: getNotificationDate(task),
       priority: task.priority,
       note: task.note,
     });
@@ -352,11 +373,11 @@ export default function Home() {
       currentTasks.map((task) =>
         task.id === taskId
           ? {
-              ...task,
-              completed: !task.completed,
-              completedAt: task.completed ? undefined : now,
-              updatedAt: now,
-            }
+            ...task,
+            completed: !task.completed,
+            completedAt: task.completed ? undefined : now,
+            updatedAt: now,
+          }
           : task,
       ),
     );
@@ -375,9 +396,6 @@ export default function Home() {
             <ClipboardList size={18} aria-hidden="true" />
             <span>課題・締め切り管理</span>
           </div>
-          <h1 className="task-title text-2xl font-bold text-slate-950 md:text-3xl">
-            今日やる課題を見失わない
-          </h1>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <span className="badge badge-blue">未完了 {stats.open}</span>
@@ -431,6 +449,19 @@ export default function Home() {
                   value={form.dueDate}
                   onChange={(event) =>
                     setForm((current) => ({ ...current, dueDate: event.target.value }))
+                  }
+                />
+              </div>
+
+              <div className="field">
+                <label htmlFor="notificationDate">通知日</label>
+                <input
+                  className="control"
+                  id="notificationDate"
+                  type="date"
+                  value={form.notificationDate}
+                  onChange={(event) =>
+                    setForm((current) => ({ ...current, notificationDate: event.target.value }))
                   }
                 />
               </div>
@@ -500,7 +531,7 @@ export default function Home() {
             <div className="field">
               <label htmlFor="note">メモ</label>
               <textarea
-                className="control min-h-[86px] resize-y"
+                className="control h-[150px] resize-none overflow-scroll overflow-x-hidden"
                 id="note"
                 maxLength={240}
                 placeholder="提出場所や範囲など"
@@ -532,6 +563,7 @@ export default function Home() {
               <div className="grid gap-2 md:grid-cols-2">
                 {closeTasks.map((task) => {
                   const dueStatus = getDueStatus(task);
+                  const notificationDate = getNotificationDate(task);
 
                   return (
                     <div
@@ -541,7 +573,7 @@ export default function Home() {
                       <div className="min-w-0">
                         <p className="task-title font-bold text-slate-900">{task.title}</p>
                         <p className="task-title text-sm text-slate-600">
-                          {task.subject} / {formatDate(task.dueDate)}
+                          {task.subject} / 通知日 {formatDate(notificationDate)} / 締切 {formatDate(task.dueDate)}
                         </p>
                       </div>
                       <span className={badgeClass(dueStatus.tone)}>{dueStatus.label}</span>
@@ -550,7 +582,7 @@ export default function Home() {
                 })}
               </div>
             ) : (
-              <p className="text-sm font-bold text-slate-500">今日・明日締切の未完了課題はありません</p>
+              <p className="text-sm font-bold text-slate-500">通知日を迎えた未完了課題はありません</p>
             )}
           </section>
 
@@ -571,7 +603,7 @@ export default function Home() {
                         size={17}
                       />
                       <input
-                        className="control pl-9"
+                        className="control search-control"
                         placeholder="課題名・科目・メモを検索"
                         value={searchTerm}
                         onChange={(event) => setSearchTerm(event.target.value)}
@@ -667,9 +699,8 @@ export default function Home() {
                         <div className="min-w-0">
                           <div className="mb-2 flex flex-wrap items-center gap-2">
                             <h3
-                              className={`task-title text-lg font-bold ${
-                                task.completed ? "text-slate-500 line-through" : "text-slate-950"
-                              }`}
+                              className={`task-title text-lg font-bold ${task.completed ? "text-slate-500 line-through" : "text-slate-950"
+                                }`}
                             >
                               {task.title}
                             </h3>
@@ -680,6 +711,10 @@ export default function Home() {
                             <span className="badge badge-blue">
                               <CalendarDays size={13} aria-hidden="true" />
                               {formatDate(task.dueDate)}
+                            </span>
+                            <span className="badge badge-amber">
+                              <Bell size={13} aria-hidden="true" />
+                              通知日 {formatDate(getNotificationDate(task))}
                             </span>
                             <span className="badge badge-green">
                               <BookOpen size={13} aria-hidden="true" />
