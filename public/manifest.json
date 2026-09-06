@@ -1,0 +1,11 @@
+{
+  "name": "課題・締め切り管理",
+  "short_name": "課題管理",
+  "description": "課題の締切と通知日を管理するアプリ",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f6f7f9",
+  "theme_color": "#0f766e",
+  "lang": "ja"
+}

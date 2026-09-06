@@ -19,6 +19,10 @@ import {
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
 const STORAGE_KEY = "assignment-deadline-manager.tasks";
+const NOTIFIED_STORAGE_KEY = "assignment-deadline-manager.notified";
+const NOTIFICATION_ENABLED_STORAGE_KEY = "assignment-deadline-manager.notification-enabled";
+const NOTIFICATION_CHECK_INTERVAL_MS = 60_000;
+const SERVICE_WORKER_URL = "/sw.js";
 
 const TASK_TYPES = [
   { value: "report", label: "レポート" },
@@ -37,6 +41,12 @@ type TaskType = (typeof TASK_TYPES)[number]["value"];
 type Priority = (typeof PRIORITIES)[number]["value"];
 type SortMode = "dueDate" | "priority" | "createdAt";
 type StatusFilter = "all" | "open" | "completed";
+type NotificationState = NotificationPermission | "unsupported";
+type ServiceWorkerState = "idle" | "ready" | "unsupported";
+type VisibleNotificationOptions = NotificationOptions & {
+  renotify?: boolean;
+  timestamp?: number;
+};
 
 type Assignment = {
   id: string;
@@ -212,6 +222,220 @@ function sortNotificationTasks(tasks: Assignment[]) {
   });
 }
 
+function getNotificationSentKey(task: Assignment) {
+  return `${todayKey()}:${task.id}:${getNotificationDate(task)}`;
+}
+
+function readNotifiedKeys() {
+  try {
+    const storedKeys = localStorage.getItem(NOTIFIED_STORAGE_KEY);
+    if (!storedKeys) return new Set<string>();
+
+    const parsedKeys = JSON.parse(storedKeys);
+    return new Set(Array.isArray(parsedKeys) ? (parsedKeys as string[]) : []);
+  } catch {
+    localStorage.removeItem(NOTIFIED_STORAGE_KEY);
+    return new Set<string>();
+  }
+}
+
+function writeNotifiedKeys(keys: Set<string>) {
+  const todayPrefix = `${todayKey()}:`;
+  const todayKeys = Array.from(keys).filter((key) => key.startsWith(todayPrefix));
+  localStorage.setItem(NOTIFIED_STORAGE_KEY, JSON.stringify(todayKeys));
+}
+
+function getNotificationLabel(permission: NotificationState) {
+  if (permission === "granted") return "通知OFF";
+  if (permission === "denied") return "通知OFF";
+  if (permission === "unsupported") return "通知非対応";
+  return "通知OFF";
+}
+
+function getServiceWorkerLabel(
+  permission: NotificationState,
+  serviceWorkerState: ServiceWorkerState,
+  notificationEnabled: boolean,
+) {
+  if (permission !== "granted") return getNotificationLabel(permission);
+  if (!notificationEnabled) return "通知OFF";
+  if (serviceWorkerState === "ready") return "通知ON";
+  if (serviceWorkerState === "unsupported") return "バックグラウンド非対応";
+  return "通知準備中";
+}
+
+function isWebPushSupported() {
+  if (typeof navigator === "undefined" || typeof window === "undefined") return false;
+  return "serviceWorker" in navigator && "PushManager" in window;
+}
+
+function shouldUseLocalReminders(notificationEnabled: boolean, useLocalFallback: boolean) {
+  return notificationEnabled && (useLocalFallback || !isWebPushSupported());
+}
+
+function shouldUseServerPush(notificationEnabled: boolean, useLocalFallback: boolean) {
+  return notificationEnabled && !useLocalFallback && isWebPushSupported();
+}
+
+function showLocalTaskNotification(task: Assignment) {
+  const notificationDate = getNotificationDate(task);
+  const options: VisibleNotificationOptions = {
+    body: `${task.title} / 締切 ${formatDate(task.dueDate)}`,
+    data: { taskId: task.id },
+    renotify: true,
+    requireInteraction: true,
+    silent: false,
+    tag: `assignment-${task.id}-${notificationDate}`,
+    timestamp: Date.now(),
+  };
+
+  new Notification("課題の通知日です", options);
+}
+
+async function registerBackgroundNotificationChecks(registration: ServiceWorkerRegistration) {
+  const periodicSync = "periodicSync" in registration
+    ? (registration as ServiceWorkerRegistration & {
+      periodicSync: { register: (tag: string, options?: { minInterval?: number }) => Promise<void> };
+    }).periodicSync
+    : null;
+
+  if (periodicSync) {
+    await periodicSync.register("assignment-reminders", {
+      minInterval: NOTIFICATION_CHECK_INTERVAL_MS,
+    });
+  }
+
+  const sync = "sync" in registration
+    ? (registration as ServiceWorkerRegistration & {
+      sync: { register: (tag: string) => Promise<void> };
+    }).sync
+    : null;
+
+  if (sync) {
+    await sync.register("assignment-reminders");
+  }
+}
+
+async function postServiceWorkerMessage(message: unknown) {
+  if (!("serviceWorker" in navigator)) return;
+
+  const registration = await navigator.serviceWorker.ready;
+  registration.active?.postMessage(message);
+}
+
+function urlBase64ToUint8Array(value: string) {
+  const padding = "=".repeat((4 - (value.length % 4)) % 4);
+  const base64 = `${value}${padding}`.replace(/-/g, "+").replace(/_/g, "/");
+  const rawData = window.atob(base64);
+
+  return Uint8Array.from([...rawData].map((character) => character.charCodeAt(0)));
+}
+
+function arrayBuffersEqual(left: ArrayBuffer | null, right: Uint8Array) {
+  if (!left || left.byteLength !== right.byteLength) return false;
+
+  const leftBytes = new Uint8Array(left);
+  return leftBytes.every((byte, index) => byte === right[index]);
+}
+
+async function getVapidPublicKey() {
+  const response = await fetch("/api/push/vapid-public-key", {
+    cache: "no-store",
+  });
+
+  if (!response.ok) {
+    throw new Error("VAPID public key could not be loaded.");
+  }
+
+  const payload = (await response.json()) as { publicKey?: string };
+  if (!payload.publicKey) {
+    throw new Error("VAPID public key is missing.");
+  }
+
+  return payload.publicKey;
+}
+
+async function subscribeToWebPush() {
+  if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
+    throw new Error("Push API is not supported.");
+  }
+
+  const registration = await navigator.serviceWorker.ready;
+  const publicKey = await getVapidPublicKey();
+  const applicationServerKey = urlBase64ToUint8Array(publicKey);
+  const existingSubscription = await registration.pushManager.getSubscription();
+
+  if (existingSubscription) {
+    if (arrayBuffersEqual(existingSubscription.options.applicationServerKey, applicationServerKey)) {
+      return existingSubscription;
+    }
+
+    await existingSubscription.unsubscribe();
+  }
+
+  return registration.pushManager.subscribe({
+    applicationServerKey,
+    userVisibleOnly: true,
+  });
+}
+
+async function resetWebPushSubscription() {
+  if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
+    throw new Error("Push API is not supported.");
+  }
+
+  const registration = await navigator.serviceWorker.ready;
+  const existingSubscription = await registration.pushManager.getSubscription();
+  await existingSubscription?.unsubscribe();
+
+  const publicKey = await getVapidPublicKey();
+  return registration.pushManager.subscribe({
+    applicationServerKey: urlBase64ToUint8Array(publicKey),
+    userVisibleOnly: true,
+  });
+}
+
+async function saveWebPushSubscription(subscription: PushSubscription) {
+  const response = await fetch("/api/push/subscribe", {
+    body: JSON.stringify({ subscription }),
+    headers: {
+      "Content-Type": "application/json",
+    },
+    method: "POST",
+  });
+
+  if (!response.ok) {
+    throw new Error("Push subscription could not be saved.");
+  }
+}
+
+async function ensureWebPushReady() {
+  let subscription = await subscribeToWebPush();
+
+  try {
+    await saveWebPushSubscription(subscription);
+  } catch {
+    subscription = await resetWebPushSubscription();
+    await saveWebPushSubscription(subscription);
+  }
+
+  return subscription;
+}
+
+async function savePushAppState(tasks: Assignment[], notificationEnabled: boolean) {
+  const response = await fetch("/api/push/state", {
+    body: JSON.stringify({ notificationEnabled, tasks }),
+    headers: {
+      "Content-Type": "application/json",
+    },
+    method: "POST",
+  });
+
+  if (!response.ok) {
+    throw new Error("Push app state could not be saved.");
+  }
+}
+
 export default function Home() {
   const [tasks, setTasks] = useState<Assignment[]>([]);
   const [form, setForm] = useState<AssignmentForm>(emptyForm);
@@ -222,6 +446,39 @@ export default function Home() {
   const [subjectFilter, setSubjectFilter] = useState("all");
   const [typeFilter, setTypeFilter] = useState<"all" | TaskType>("all");
   const [isHydrated, setIsHydrated] = useState(false);
+  const [notificationPermission, setNotificationPermission] =
+    useState<NotificationState>("default");
+  const [serviceWorkerState, setServiceWorkerState] = useState<ServiceWorkerState>("idle");
+  const [notificationEnabled, setNotificationEnabled] = useState(false);
+  const [useLocalNotificationFallback, setUseLocalNotificationFallback] = useState(false);
+
+  useEffect(() => {
+    if (!("Notification" in window)) {
+      setNotificationPermission("unsupported");
+      return;
+    }
+
+    setNotificationPermission(Notification.permission);
+  }, []);
+
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) {
+      setServiceWorkerState("unsupported");
+      return;
+    }
+
+    navigator.serviceWorker
+      .register(SERVICE_WORKER_URL)
+      .then((registration) => registration.update().then(() => registration))
+      .then(() => navigator.serviceWorker.ready)
+      .then((registration) => {
+        void registerBackgroundNotificationChecks(registration);
+        setServiceWorkerState("ready");
+      })
+      .catch(() => {
+        setServiceWorkerState("unsupported");
+      });
+  }, []);
 
   useEffect(() => {
     try {
@@ -230,9 +487,15 @@ export default function Home() {
         const parsedTasks = JSON.parse(storedTasks);
         setTasks(Array.isArray(parsedTasks) ? (parsedTasks as Assignment[]) : []);
       }
+
+      setNotificationEnabled(
+        window.isSecureContext &&
+        localStorage.getItem(NOTIFICATION_ENABLED_STORAGE_KEY) === "true",
+      );
     } catch {
       localStorage.removeItem(STORAGE_KEY);
       setTasks([]);
+      setNotificationEnabled(false);
     } finally {
       setIsHydrated(true);
     }
@@ -240,9 +503,112 @@ export default function Home() {
 
   useEffect(() => {
     if (isHydrated) {
+      const serverPushEnabled = shouldUseServerPush(
+        notificationEnabled && notificationPermission === "granted",
+        useLocalNotificationFallback,
+      );
+
       localStorage.setItem(STORAGE_KEY, JSON.stringify(tasks));
+      localStorage.setItem(NOTIFICATION_ENABLED_STORAGE_KEY, String(notificationEnabled));
+      void savePushAppState(tasks, serverPushEnabled).catch(() => undefined);
     }
-  }, [isHydrated, tasks]);
+  }, [
+    isHydrated,
+    notificationEnabled,
+    notificationPermission,
+    tasks,
+    useLocalNotificationFallback,
+  ]);
+
+  useEffect(() => {
+    if (!isHydrated || serviceWorkerState !== "ready") return;
+
+    void postServiceWorkerMessage({
+      type: "SYNC_ASSIGNMENTS",
+      notificationEnabled,
+      useLocalReminders: shouldUseLocalReminders(
+        notificationEnabled,
+        useLocalNotificationFallback,
+      ),
+      tasks,
+    });
+  }, [isHydrated, notificationEnabled, serviceWorkerState, tasks, useLocalNotificationFallback]);
+
+  useEffect(() => {
+    if (
+      !isHydrated ||
+      !notificationEnabled ||
+      notificationPermission !== "granted" ||
+      serviceWorkerState !== "ready"
+    ) {
+      return;
+    }
+
+    if (!isWebPushSupported()) {
+      setUseLocalNotificationFallback(true);
+      return;
+    }
+
+    let isCancelled = false;
+    setUseLocalNotificationFallback(false);
+
+    void ensureWebPushReady()
+      .then(() => {
+        if (isCancelled) return;
+        return savePushAppState(tasks, true);
+      })
+      .catch(() => {
+        if (isCancelled) return;
+        setUseLocalNotificationFallback(true);
+        void savePushAppState(tasks, false).catch(() => undefined);
+      });
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [isHydrated, notificationEnabled, notificationPermission, serviceWorkerState, tasks]);
+
+  useEffect(() => {
+    if (
+      !isHydrated ||
+      !notificationEnabled ||
+      notificationPermission !== "granted" ||
+      serviceWorkerState !== "unsupported"
+    ) {
+      return;
+    }
+
+    async function notifyDueTasks() {
+      const notifiedKeys = readNotifiedKeys();
+      let hasNewNotification = false;
+
+      sortNotificationTasks(tasks)
+        .filter((task) => !task.completed && diffDaysFromToday(getNotificationDate(task)) <= 0)
+        .forEach((task) => {
+          const sentKey = getNotificationSentKey(task);
+          if (notifiedKeys.has(sentKey)) return;
+
+          showLocalTaskNotification(task);
+
+          notifiedKeys.add(sentKey);
+          hasNewNotification = true;
+        });
+
+      if (hasNewNotification) {
+        writeNotifiedKeys(notifiedKeys);
+      }
+    }
+
+    notifyDueTasks();
+
+    const intervalId = window.setInterval(notifyDueTasks, NOTIFICATION_CHECK_INTERVAL_MS);
+    document.addEventListener("visibilitychange", notifyDueTasks);
+
+    return () => {
+      window.clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", notifyDueTasks);
+    };
+  }, [isHydrated, notificationEnabled, notificationPermission, serviceWorkerState, tasks]);
 
   const subjects = useMemo(() => {
     return Array.from(new Set(tasks.map((task) => task.subject))).sort((a, b) =>
@@ -388,6 +754,81 @@ export default function Home() {
     setEditingId(null);
   }
 
+  async function toggleNotifications() {
+    if (!("Notification" in window)) {
+      setNotificationPermission("unsupported");
+      setNotificationEnabled(false);
+      setUseLocalNotificationFallback(false);
+      return;
+    }
+
+    if (Notification.permission === "granted") {
+      const nextEnabled = !notificationEnabled;
+      let nextUseLocalFallback = false;
+      setNotificationPermission("granted");
+
+      if (nextEnabled) {
+        if (isWebPushSupported()) {
+          try {
+            await ensureWebPushReady();
+            await savePushAppState(tasks, true);
+          } catch {
+            nextUseLocalFallback = true;
+            await savePushAppState(tasks, false).catch(() => undefined);
+          }
+        } else {
+          nextUseLocalFallback = true;
+          await savePushAppState(tasks, false).catch(() => undefined);
+        }
+      } else {
+        await savePushAppState(tasks, false).catch(() => undefined);
+      }
+
+      setUseLocalNotificationFallback(nextUseLocalFallback);
+      setNotificationEnabled(nextEnabled);
+      void postServiceWorkerMessage({
+        type: "SET_NOTIFICATION_ENABLED",
+        notificationEnabled: nextEnabled,
+        useLocalReminders: shouldUseLocalReminders(nextEnabled, nextUseLocalFallback),
+      });
+      return;
+    }
+
+    const permission = await Notification.requestPermission();
+    setNotificationPermission(permission);
+
+    const nextEnabled = permission === "granted";
+
+    if (permission === "granted") {
+      let nextUseLocalFallback = false;
+
+      if (isWebPushSupported()) {
+        try {
+          await ensureWebPushReady();
+          await savePushAppState(tasks, true);
+        } catch {
+          nextUseLocalFallback = true;
+          await savePushAppState(tasks, false).catch(() => undefined);
+        }
+      } else {
+        nextUseLocalFallback = true;
+        await savePushAppState(tasks, false).catch(() => undefined);
+      }
+
+      setUseLocalNotificationFallback(nextUseLocalFallback);
+      setNotificationEnabled(nextEnabled);
+      void postServiceWorkerMessage({
+        type: "SYNC_ASSIGNMENTS",
+        notificationEnabled: nextEnabled,
+        useLocalReminders: shouldUseLocalReminders(nextEnabled, nextUseLocalFallback),
+        tasks,
+      });
+    } else {
+      setUseLocalNotificationFallback(false);
+      setNotificationEnabled(nextEnabled);
+    }
+  }
+
   return (
     <main className="app-shell">
       <header className="mb-5 flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
@@ -398,6 +839,15 @@ export default function Home() {
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
+          <button
+            className="btn btn-secondary"
+            disabled={notificationPermission === "unsupported"}
+            type="button"
+            onClick={toggleNotifications}
+          >
+            <Bell size={16} aria-hidden="true" />
+            {getServiceWorkerLabel(notificationPermission, serviceWorkerState, notificationEnabled)}
+          </button>
           <span className="badge badge-blue">未完了 {stats.open}</span>
           <span className="badge badge-amber">今日 {stats.today}</span>
           <span className="badge badge-red">期限切れ {stats.overdue}</span>
